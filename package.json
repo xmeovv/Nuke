@@ -1,7 +1,7 @@
 {
   "name": "nuke",
   "version": "1.0.0",
-  "description": "Discord bot that nukes a server into 26 text + 16 voice channels and spams them, dressed up as a music bot.",
+  "description": "Discord bot that nukes a server into 51 text + 31 voice channels and spams them, dressed up as a music bot.",
   "main": "index.js",
   "type": "module",
   "private": true,
