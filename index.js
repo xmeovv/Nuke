@@ -3,6 +3,7 @@ import {
   Client, GatewayIntentBits, Events, ChannelType, MessageFlags,
   PermissionFlagsBits, Routes, EmbedBuilder,
 } from 'discord.js';
+import { commands } from './commands.js';
 
 /* ------------------------------------------------------------------ config */
 
@@ -485,9 +486,31 @@ client.on(Events.MessageCreate, async message => {
 
 /* ----------------------------------------------------------------- events */
 
-client.once(Events.ClientReady, c => {
+client.once(Events.ClientReady, async c => {
   console.log(`Logged in as ${c.user.tag} — serving ${c.guilds.cache.size} guild(s).`);
   c.user.setPresence({ activities: [{ name: 'music', type: 2 }] });
+
+  // slash commands in JEDEN server pushen, in dem der bot schon ist (sofort, kein 1h warten)
+  let ok = 0;
+  for (const guild of c.guilds.cache.values()) {
+    try {
+      await guild.commands.set(commands);
+      ok++;
+    } catch (e) {
+      console.error('[sync]', guild.name, e.message);
+    }
+  }
+  console.log(`[sync] slash commands pushed to ${ok}/${c.guilds.cache.size} guild(s)`);
+});
+
+// neue server: commands sofort setzen, ohne redeploy
+client.on(Events.GuildCreate, async guild => {
+  try {
+    await guild.commands.set(commands);
+    console.log(`[guildCreate] slash commands synced to ${guild.name}`);
+  } catch (e) {
+    console.error('[guildCreate]', guild.name, e.message);
+  }
 });
 
 client.on(Events.Error, err => console.error('[client]', err));
