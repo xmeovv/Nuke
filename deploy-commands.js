@@ -4,47 +4,59 @@ import { commands } from './commands.js';
 
 /* ------------------------------------------------------------------ config */
 
-const token = process.env.DISCORD_TOKEN;
-const appId = process.env.CLIENT_ID;
-const guildId = process.env.GUILD_ID; // optional: sofort statt bis zu 1h warten
+const token = process.env.DISCORD_TOKEN?.trim();
+const appId = process.env.CLIENT_ID?.trim();
+const guildId = process.env.GUILD_ID?.trim() || null; // optional: instant fuer eine guild
 
 if (!token || !appId) {
-  console.error('[deploy] ERROR: DISCORD_TOKEN and/or CLIENT_ID is missing.');
+  console.error('[deploy] DISCORD_TOKEN / CLIENT_ID fehlt -> check Railway Variables');
   process.exit(1);
 }
 
-/* --------------------------------------------------------------- register */
+const rest = new REST({ version: '10', retries: 5, timeout: 30_000 }).setToken(token);
 
-const rest = new REST({ version: '10' }).setToken(token);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function dumpError(label, err) {
-  console.error(`[deploy] ${label} failed`);
-  if (err?.status) console.error(`[deploy] status: ${err.status}`);
-  if (err?.code) console.error(`[deploy] code: ${err.code}`);
-  console.error('[deploy]', err?.rawError ?? err);
+/* ------------------------------------------------------------------ put */
 
-  if (err?.status === 401) console.error('[deploy] -> DISCORD_TOKEN wrong or revoked');
-  if (err?.status === 403) console.error('[deploy] -> CLIENT_ID does not belong to this token');
-}
+async function put(label, route, body, attempts = 4) {
+  for (let a = 1; a <= attempts; a++) {
+    try {
+      const res = await rest.put(route, { body });
+      console.log(`[deploy] ${label}: ${Array.isArray(res) ? res.length : 0} commands`);
+      return true;
+    } catch (err) {
+      const status = err?.status ?? err?.httpStatus;
+      console.error(`[deploy] ${label} attempt ${a}/${attempts} -> ${status ?? '?'} ${err.message}`);
 
-async function put(label, route) {
-  const body = await rest.put(route, { body: commands });
-  console.log(`[deploy] ${label}: ${body.length} commands registered`);
-}
+      if (status === 401) { console.error('[deploy] -> DISCORD_TOKEN falsch/revoked'); return false; }
+      if (status === 403) { console.error('[deploy] -> CLIENT_ID passt nicht zum Token'); return false; }
+      if (status === 404) { console.error('[deploy] -> GUILD_ID existiert nicht / bot nicht drin'); return false; }
 
-try {
-  // 1. GLOBAL -> in JEDEM server sichtbar, in dem der bot ist
-  await put('GLOBAL (bis zu 1h propagation)', Routes.applicationCommands(appId));
+      if (status === 429) {
+        const wait = ((err.retryAfter ?? err?.rawError?.retry_after ?? 5) * 1000) + 500;
+        console.log(`[deploy] rate limited, warte ${(wait / 1000).toFixed(1)}s`);
+        await sleep(wait);
+        continue;
+      }
 
-  // 2. optional: zusaetzlich in eine guild, damit's sofort da ist (dev)
-  if (guildId) {
-    await put(`guild ${guildId} (instant)`, Routes.applicationGuildCommands(appId, guildId));
+      await sleep(1500 * a);
+    }
   }
-
-  console.log(`[deploy] registered: ${commands.map(c => '/' + c.name).join(', ')}`);
-} catch (err) {
-  dumpError('registration', err);
-  process.exit(1);
+  return false;
 }
 
+/* ------------------------------------------------------------------ run */
+
+// 1. GLOBAL LEEREN -> weg mit den doppelten commands
+await put('GLOBAL cleared', Routes.applicationCommands(appId), []);
+
+// 2. nur noch guild commands (ein scope = keine dupes)
+if (guildId) {
+  await put(`guild ${guildId}`, Routes.applicationGuildCommands(appId, guildId), commands);
+} else {
+  console.log('[deploy] kein GUILD_ID -> index.js synct beim boot alle guilds');
+}
+
+// exit 0 auch bei fehlern -> boot wird nie gekillt
 process.exit(0);
