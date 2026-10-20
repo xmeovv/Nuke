@@ -6,12 +6,9 @@ import {
 
 /* ------------------------------------------------------------------ helpers */
 
-const integrationTypes = [
-  ApplicationIntegrationType.UserInstall,
-  ApplicationIntegrationType.GuildInstall,
-];
+// NUR GuildInstall -> keine zweite "user app" kopie = keine dupes
+const integrationTypes = [ApplicationIntegrationType.GuildInstall];
 
-// boilerplate killer: jede command kriegt integration types + guild context
 const cmd = (name, description, build) => {
   const b = new SlashCommandBuilder()
     .setName(name)
