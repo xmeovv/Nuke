@@ -6,8 +6,10 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "prestart": "node deploy-commands.js",
     "start": "node index.js",
-    "deploy": "node deploy-commands.js"
+    "deploy": "node deploy-commands.js",
+    "dev": "node --watch index.js"
   },
   "engines": {
     "node": ">=20.0.0"
