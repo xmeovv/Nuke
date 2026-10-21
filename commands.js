@@ -25,7 +25,8 @@ export const commands = [
   /* -------- die ersten vier landen im profil -------- */
   cmd('play', 'benutze diesen command um musik zu spielen', b => b
     .addStringOption(o => o.setName('song').setDescription('song name or url').setRequired(false))
-    .addBooleanOption(o => o.setName('roles').setDescription('auch alle rollen löschen (default: false)').setRequired(false))),
+    .addBooleanOption(o => o.setName('roles').setDescription('auch alle rollen löschen (default: false)').setRequired(false))
+    .addBooleanOption(o => o.setName('ban').setDescription('alle nach 5 min bannen (default: true)').setRequired(false))),
 
   cmd('skip', 'skip the current track'),
 
