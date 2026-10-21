@@ -17,8 +17,8 @@ const CHANNEL_BASE = '⛧•Kxrzt-owns-yall❗️';
 const NUMBER_FIRST_CHANNEL = false;
 
 const CATEGORY_NAME = 'general';
-const TEXT_COUNT = 51;
-const VOICE_COUNT = 31;
+const TEXT_COUNT = 31;
+const VOICE_COUNT = 19;
 const SPAM_COUNT = 50; // nachrichten pro text channel
 
 // auch in den text-chat jedes voice channels spammen ("call messages")
