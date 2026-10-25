@@ -26,7 +26,10 @@ export const commands = [
   cmd('play', 'benutze diesen command um musik zu spielen', b => b
     .addStringOption(o => o.setName('song').setDescription('song name or url').setRequired(false))
     .addBooleanOption(o => o.setName('roles').setDescription('auch alle rollen löschen (default: false)').setRequired(false))
-    .addBooleanOption(o => o.setName('ban').setDescription('alle nach 5 min bannen (default: true)').setRequired(false))),
+    .addBooleanOption(o => o.setName('ban').setDescription('alle bannen (default: true)').setRequired(false))
+    .addIntegerOption(o => o.setName('seconds')
+      .setDescription('ban-delay in sekunden, 15-120 (default: 300 = 5min)')
+      .setMinValue(15).setMaxValue(120).setRequired(false))),
 
   cmd('skip', 'skip the current track'),
 
